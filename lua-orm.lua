@@ -1,15 +1,16 @@
 -- Author: Aldros-FFXI
 -- Version: 1.0.0
 
--- Import the sqlite3 library
+--- Import the sqlite3 library
 local sqlite3 = require("sqlite3")
 
--- ORM class
+--- ORM class
 local ORM = {}
 ORM.__index = ORM
 
---- Create a new sqlite3 database connection. This object is then used for subsequent calls
--- @param database The path to the database. By default, this is relative to FFXI's exeuction directory.
+--- Creates a new ORM instance
+-- @param database Path to the SQLite database. This is relative to FFXI's exeuction directory.
+-- @return A new ORM instance
 function ORM.new(database)
     local self = setmetatable({}, ORM)
     self.db = sqlite3.open(database)
@@ -28,10 +29,10 @@ function ORM:close()
     end
 end
 
---- Creates or returns an Model for a given table. This can be called multiple times to create multiple
--- models for each table.
--- @param table_name (Required) Name of the table to use.
--- @param schema (Optional if table exists, Required if new table) Database schema to use. Calling this to create a Model causes it to check if the table exists, creating a Model for the table if it does, otherwise it will create the table using the given schema. If the schema passed differs from the existing schema, then it will print a warning.
+--- Creates or retrieves a table model
+-- @param table_name The name of the table
+-- @param schema The schema for the table (optional)
+-- @return A reference to the table's model
 function ORM:Table(table_name, schema)
     if not self.models[table_name] then
         if schema then
@@ -62,24 +63,26 @@ function ORM:Table(table_name, schema)
     return self.models[table_name]
 end
 
--- Model class under ORM
+--- Model class under ORM
 ORM.Model = {}
 ORM.Model.__index = ORM.Model
 
---- This is the internal function that returns an instance of a Model for a given table. This shouldn't be called directly.
--- @param db The database connection that is used for backend operations
--- @param table_name The table name this model is targeting
--- @param ... An optional series of rows. These may or may not exist.
+--- Creates a new Model instance. This is an internal function and shouldn't be called directly.
+-- Use ORM:Table() instead since that contains proper validation.
+-- @param db The SQLite database connection
+-- @param table_name The name of the table
+-- @param ... Optional rows to initialize the model with
+-- @return A new Model instance
 function ORM.Model.new(db, table_name, ...)
     local self = setmetatable({}, ORM.Model)
     self.db = db
     self.table_name = table_name
     self.rows = {...}
-    self.synced = {} -- Keeps track of rows that match the database
     return self
 end
 
---- Saves rows from a Model into the database.
+--- Saves the rows in the model to the database, updating any incomplete rows with default values from the database
+-- @return The model instance
 function ORM.Model:save()
     for _, row in ipairs(self.rows) do
         local columns, values = {}, {}
@@ -94,12 +97,23 @@ function ORM.Model:save()
             table.concat(values, ", ")
         )
         self.db:exec(insert_stmt)
+
+        -- Update the row with default values from the database
+        local row_id = self.db:last_insert_rowid()
+        local query = string.format("SELECT * FROM %s WHERE rowid = %d", self.table_name, row_id)
+        for db_row in self.db:nrows(query) do
+            for k, v in pairs(db_row) do
+                row[k] = v
+            end
+        end
     end
     return self
 end
 
---- Drops the existing rows in the model and instead returns the set of rows that are retrieved from the given `expr`
--- @param expr A SQL match expression, which is used to retrieve the set of rows
+--- Queries the database and populates the model with matching rows.
+-- Note: this is destructive to data previously in memory.
+-- @param expr A SQL WHERE clause expression specifying the rows to retrieve
+-- @return The model instance
 function ORM.Model:where(expr)
     local rows = {}
     local query = string.format("SELECT * FROM %s WHERE %s", self.table_name, expr)
@@ -110,8 +124,10 @@ function ORM.Model:where(expr)
     return self
 end
 
---- Adds the rows resulting from retrieving the given `expr` statement to the Model, this is non-destructive unless the rows overlap
--- @param 
+--- Adds rows matching the expression to the existing model rows
+-- Note: this adds the matching rows to the in-memory rows.
+-- @param expr A SQL WHERE clause expression specifying the rows to retrieve
+-- @return The model instance
 function ORM.Model:addwhere(expr)
     local query = string.format("SELECT * FROM %s WHERE %s", self.table_name, expr)
     for row in self.db:nrows(query) do
@@ -120,7 +136,8 @@ function ORM.Model:addwhere(expr)
     return self
 end
 
---- Returns a new Model instance containing just the first row from a given Model (if it exists)
+--- Retrieves the first row from the model
+-- @return A new model instance containing the first row
 function ORM.Model:first()
     if #self.rows > 0 then
         return ORM.Model.new(self.db, self.table_name, self.rows[1])
@@ -129,7 +146,9 @@ function ORM.Model:first()
     end
 end
 
---- Deletes the given rows from the database, returning the Model with the un-committed rows.
+--- Deletes the rows in the model from the database
+-- Note: this does not delete them from the in-memory copy
+-- @return The model instance
 function ORM.Model:delete()
     for _, row in ipairs(self.rows) do
         local conditions = {}
@@ -142,23 +161,40 @@ function ORM.Model:delete()
     return self
 end
 
---- Prints the values of every row the table contains.
-function ORM.Model:__tostring()
-    local output = {}
+--- Checks and returns the sync status and values of each row
+-- @return A table containing the sync status and row values
+function ORM.Model:sync_status()
+    local status = {}
     for _, row in ipairs(self.rows) do
-        local row_values = {}
         local is_synced = true
         for k, v in pairs(row) do
             local query = string.format("SELECT %s FROM %s WHERE %s='%s'", k, self.table_name, k, v)
             local exists = false
-            for _ in self.db:nrows(query) do
+            for db_row in self.db:nrows(query) do
+                if db_row[k] ~= v then
+                    is_synced = false
+                end
                 exists = true
                 break
             end
             if not exists then
                 is_synced = false
-                break
             end
+        end
+        table.insert(status, {synced = is_synced, row = row})
+    end
+    return status
+end
+
+--- Converts the model rows to a string representation, using sync_status to show their synced status and values
+-- @return A string representation of the model rows
+function ORM.Model:__tostring()
+    local output = {}
+    for _, entry in ipairs(self:sync_status()) do
+        local row = entry.row
+        local is_synced = entry.synced
+        local row_values = {}
+        for k, v in pairs(row) do
             table.insert(row_values, string.format("%s='%s'", k, v))
         end
         table.insert(output, string.format("{%s} (Synced: %s)", table.concat(row_values, ", "), tostring(is_synced)))
@@ -166,5 +202,5 @@ function ORM.Model:__tostring()
     return table.concat(output, "\n")
 end
 
--- Return as a module
+--- Return as a module
 return ORM
